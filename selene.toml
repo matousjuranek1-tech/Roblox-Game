@@ -1,0 +1,5 @@
+std = "roblox"
+
+[lints]
+# Luau type annotations are checked by luau-lsp; selene only lints style and correctness.
+shadowing = "allow"

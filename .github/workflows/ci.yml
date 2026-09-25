@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lint, type-check, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Versions match rokit.toml.
+      - name: Install toolchain
+        run: |
+          mkdir -p "$HOME/bin"
+          fetch() { curl -sSfL -o "/tmp/$1.zip" "$2" && unzip -o -q "/tmp/$1.zip" -d "$HOME/bin"; }
+          fetch rojo https://github.com/rojo-rbx/rojo/releases/download/v7.4.4/rojo-7.4.4-linux-x86_64.zip
+          fetch selene https://github.com/Kampfkarren/selene/releases/download/0.28.0/selene-0.28.0-linux.zip
+          fetch stylua https://github.com/JohnnyMorganz/StyLua/releases/download/v2.0.2/stylua-linux-x86_64.zip
+          fetch luau-lsp https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.70.0/luau-lsp-linux-x86_64.zip
+          fetch lune https://github.com/lune-org/lune/releases/download/v0.10.4/lune-0.10.4-linux-x86_64.zip
+          chmod +x "$HOME/bin/"*
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Format (StyLua)
+        run: stylua --check src tests
+
+      - name: Lint (selene)
+        run: selene src
+
+      - name: Build place (Rojo)
+        run: rojo build default.project.json -o Titanbound.rbxlx
+
+      - name: Type-check (luau-lsp, strict)
+        run: |
+          curl -sSfL -o globalTypes.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/1.70.0/scripts/globalTypes.None.d.luau
+          rojo sourcemap default.project.json -o sourcemap.json
+          luau-lsp analyze --platform=roblox --sourcemap=sourcemap.json --definitions=globalTypes.d.luau src
+
+      - name: Runtime smoke tests (Lune)
+        run: lune run tests/smoke.luau Titanbound.rbxlx
