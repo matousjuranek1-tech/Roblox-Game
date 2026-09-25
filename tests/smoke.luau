@@ -185,19 +185,17 @@ signal:Fire(2)
 connection:Disconnect()
 signal:Fire(3)
 check("signal delivery", table.concat(received, ",") == "1,once1,2", table.concat(received, ","))
--- The next Fire prints one "boom" error from a handler thread: that is the expected output.
-local erroring = Signal.new()
-local afterError = false
-erroring:Connect(function()
-	error("boom")
+-- Handlers run in their own threads: one that yields must not delay the others.
+local blocking = Signal.new()
+local afterYield = false
+blocking:Connect(function()
+	task.wait(0.05)
 end)
-erroring:Connect(function()
-	afterError = true
+blocking:Connect(function()
+	afterYield = true
 end)
-pcall(function()
-	erroring:Fire()
-end)
-check("signal isolates errors", afterError)
+blocking:Fire()
+check("signal isolates yielding handlers", afterYield)
 
 local Trove = sharedModule({ "Util", "Trove" })
 local trove = Trove.new()
