@@ -127,7 +127,8 @@ WallRun.Ability = {
 		if alongWall.Magnitude < 1 then
 			alongWall = MathUtil.projectOnPlane(ctx:MoveDirection(), wall.Normal)
 		end
-		local fallbackTangent = wall.Normal:Cross(Vector3.yAxis) * -wall.Side
+		-- Normal x Up points along the travel direction for a wall on the right; flip for the left.
+		local fallbackTangent = wall.Normal:Cross(Vector3.yAxis) * wall.Side
 		state.Tangent = MathUtil.flatUnit(alongWall, fallbackTangent)
 		state.Normal = wall.Normal
 		state.Side = wall.Side

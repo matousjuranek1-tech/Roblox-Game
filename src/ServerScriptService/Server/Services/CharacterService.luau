@@ -19,7 +19,7 @@ local CHARACTER_GROUP = WorldConfig.CollisionGroups.Characters
 local CHARACTER_LOAD_TIMEOUT = 10
 
 local CharacterService = {
-	-- (player, character, humanoid, root) fired once the character's core parts exist.
+	-- (player, character, humanoid, root) fired once the character is spawned in the Workspace.
 	CharacterReady = Signal.new() :: Signal.Signal<Player, Model, Humanoid, BasePart>,
 }
 
@@ -50,8 +50,14 @@ local function onCharacterAdded(player: Player, character: Model)
 		warn(`[CharacterService] {player.Name}'s character is missing Humanoid/HumanoidRootPart`)
 		return
 	end
-	if player.Character ~= character then
-		-- Respawned again while we were waiting.
+	-- CharacterAdded can fire before the character is parented and moved to its spawn point;
+	-- listeners anchor validation at the root position, so wait until it is really placed.
+	while player.Character == character and not character:IsDescendantOf(workspace) do
+		character.AncestryChanged:Wait()
+	end
+	task.wait()
+	if player.Character ~= character or not character:IsDescendantOf(workspace) then
+		-- Respawned again (or removed) while we were waiting.
 		return
 	end
 	CharacterService.CharacterReady:Fire(player, character, humanoid, root)

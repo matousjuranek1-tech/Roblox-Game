@@ -73,8 +73,6 @@ local ABILITIES: { [string]: MovementContext.Ability } = {
 	Launch = Launch,
 }
 
--- JumpRequest can fire repeatedly while the jump input is held.
-local JUMP_REPEAT_GUARD = 0.1
 local CHARACTER_LOAD_TIMEOUT = 10
 
 local MovementController = {
@@ -93,9 +91,9 @@ local MovementController = {
 local context: Context? = nil
 local characterTrove = Trove.new()
 local actionRemote: RemoteEvent
-local lastJumpHandled = 0
 local lastTargetRefresh = 0
 local sprintIdleTime = 0
+local jumpBlocked = false
 local jumpVelocity = MathUtil.jumpVelocity(MovementConfig.Jump.Height, workspace.Gravity)
 
 local snapshot: Snapshot = {
@@ -151,13 +149,20 @@ function startAction(ctx: Context, name: string, request: any): boolean
 	if current and not canInterrupt(current.Name, name) then
 		return false
 	end
+	-- Under a low obstacle only another slide is possible: anything else would stand the
+	-- character up into the ceiling.
+	local underCover = ctx.StandUpPending or (current ~= nil and current.Name == "Slide" and not Slide.HasHeadroom(ctx))
+	if underCover and name ~= "Slide" then
+		return false
+	end
 	if not ability.CanStart(ctx, request) then
 		return false
 	end
 	if current then
 		endAction(ctx, "Interrupted", true)
 	end
-	ctx.Action = { Name = name, StartTime = os.clock() }
+	local active: MovementContext.ActiveAction = { Name = name, StartTime = os.clock() }
+	ctx.Action = active
 	local payload = ability.Start(ctx, request)
 	if MovementProtocol.ServerActions[name] then
 		actionRemote:FireServer("Start", name, payload)
@@ -178,15 +183,12 @@ local function performWallJump(ctx: Context, wall: WallRun.Wall, carry: Vector3,
 	startAction(ctx, "Launch", velocity)
 end
 
-local function onJumpRequested()
+local function onJumpPressed()
 	local ctx = context
 	if not ctx or not ctx:IsUsable() then
 		return
 	end
 	local now = os.clock()
-	if now - lastJumpHandled < JUMP_REPEAT_GUARD then
-		return
-	end
 
 	local current = ctx.Action
 	local name = if current then current.Name else nil
@@ -219,13 +221,8 @@ local function onJumpRequested()
 			local velocity = ctx:Velocity()
 			ctx.Root.AssemblyLinearVelocity = Vector3.new(velocity.X, jumpVelocity, velocity.Z)
 			ctx.JumpedSinceGrounded = true
-		else
-			return
 		end
-	else
-		return
 	end
-	lastJumpHandled = now
 end
 
 local function onActionBegan(action: string)
@@ -317,6 +314,19 @@ local function step(dt: number)
 		return
 	end
 
+	if ctx.StandUpPending and not ctx.Action and Slide.HasHeadroom(ctx) then
+		ctx.Humanoid.HipHeight = ctx.DefaultHipHeight
+		ctx.StandUpPending = false
+	end
+	-- The Humanoid jumps on its own when grounded; under a low obstacle that would slam the
+	-- character into the ceiling, so jumping is disabled until there is headroom again.
+	local sliding = ctx.Action ~= nil and ctx.Action.Name == "Slide"
+	local underCover = ctx.StandUpPending or (sliding and not Slide.HasHeadroom(ctx))
+	if underCover ~= jumpBlocked then
+		jumpBlocked = underCover
+		ctx.Humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, not underCover)
+	end
+
 	ctx:RegenerateStamina(dt, now)
 	updateSprint(ctx, dt)
 	ctx.SlideHeld = InputController:IsHeld("Slide")
@@ -357,6 +367,7 @@ local function setupCharacter(character: Model)
 	end
 
 	local ctx = MovementContext.new(character, humanoid, root)
+	jumpBlocked = false
 	-- Ragdoll/trip states fight the custom movement; the game has its own stagger in PHASE 2.
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
 	humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
@@ -399,7 +410,8 @@ function MovementController:GetSnapshot(): Snapshot?
 		local wall = WallRun.CurrentWall()
 		wallSide = if wall then wall.Side else 0
 	end
-	snapshot.Action = actionName
+	-- A pending stand-up keeps the slide pose so head and torso stay under the obstacle.
+	snapshot.Action = actionName or (if ctx.StandUpPending then "Slide" else nil)
 	snapshot.Stamina = ctx.Stamina
 	snapshot.Speed = MathUtil.flat(velocity).Magnitude
 	snapshot.VerticalSpeed = velocity.Y
@@ -421,16 +433,24 @@ function MovementController:Start()
 	actionRemote = Remotes.Event("MovementAction")
 	GrappleTargeting.Init()
 
-	Remotes.Event("MovementCorrection").OnClientEvent:Connect(function(kind: unknown, action: unknown)
+	Remotes.Event("MovementCorrection").OnClientEvent:Connect(function(kind: unknown)
 		local ctx = context
 		if not ctx or type(kind) ~= "string" then
 			return
 		end
 		if kind == "Rejected" then
-			local current = ctx.Action
-			if current and current.Name == action then
-				endAction(ctx, "Rejected", true)
+			-- The rejected action may already have handed over (dash -> launch, wall jump ->
+			-- launch), so cancel whatever runs now and drop to walking speed.
+			endAction(ctx, "Rejected", true)
+			ctx:ReleaseMover()
+			ctx:ReleaseFacing()
+			local velocity = ctx:Velocity()
+			local flat = MathUtil.flat(velocity)
+			local walkSpeed = MovementConfig.Walk.Speed
+			if flat.Magnitude > walkSpeed then
+				flat = flat.Unit * walkSpeed
 			end
+			ctx.Root.AssemblyLinearVelocity = Vector3.new(flat.X, math.min(velocity.Y, 0), flat.Z)
 		elseif kind == "Corrected" then
 			interrupt("Corrected")
 		end
@@ -445,7 +465,7 @@ function MovementController:Start()
 	end)
 
 	InputController.ActionBegan:Connect(onActionBegan)
-	InputController.JumpRequested:Connect(onJumpRequested)
+	InputController.JumpPressed:Connect(onJumpPressed)
 
 	local player = Players.LocalPlayer
 	player.CharacterAdded:Connect(setupCharacter)

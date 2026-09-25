@@ -40,6 +40,8 @@ type Run = {
 }
 
 type PlayerTrialState = {
+	-- Character that finished spawning; positions of any other one are not scanned.
+	Character: Model?,
 	Run: Run?,
 	LastPosition: Vector3?,
 	CheckpointCFrame: CFrame?,
@@ -87,7 +89,7 @@ local function teleport(player: Player, state: PlayerTrialState, target: CFrame)
 	if not character or not root then
 		return
 	end
-	MovementService:NotifyTeleport(player)
+	MovementService:NotifyTeleport(player, target)
 	root.AssemblyLinearVelocity = Vector3.zero
 	character:PivotTo(target)
 	-- The jump from the old to the new position must not count as a gate crossing.
@@ -213,6 +215,7 @@ function TimeTrialService:Start()
 
 	local function onPlayerAdded(player: Player)
 		states[player] = {
+			Character = nil,
 			Run = nil,
 			LastPosition = nil,
 			CheckpointCFrame = nil,
@@ -228,11 +231,12 @@ function TimeTrialService:Start()
 		states[player] = nil
 	end)
 
-	CharacterService.CharacterReady:Connect(function(player, _character, _humanoid, root)
+	CharacterService.CharacterReady:Connect(function(player, character, _humanoid, root)
 		local state = states[player]
 		if not state then
 			return
 		end
+		state.Character = character
 		state.LastPosition = root.Position
 		if state.Run then
 			state.Run = nil
@@ -245,7 +249,7 @@ function TimeTrialService:Start()
 	RunService.Heartbeat:Connect(function()
 		local now = os.clock()
 		for player, state in states do
-			local root = CharacterService:GetRoot(player)
+			local root = if player.Character == state.Character then CharacterService:GetRoot(player) else nil
 			if root then
 				local position = root.Position
 				local last = state.LastPosition

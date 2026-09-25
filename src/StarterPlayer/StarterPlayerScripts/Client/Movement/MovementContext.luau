@@ -52,6 +52,8 @@ type ContextFields = {
 	SprintInput: boolean,
 	Sprinting: boolean,
 	SlideHeld: boolean,
+	-- Slide ended under an obstacle: stay low (HipHeight and pose) until there is headroom.
+	StandUpPending: boolean,
 	Grounded: boolean,
 	LastGroundedTime: number,
 	JumpedSinceGrounded: boolean,
@@ -141,6 +143,7 @@ function Context.new(character: Model, humanoid: Humanoid, root: BasePart): Cont
 		SprintInput = false,
 		Sprinting = false,
 		SlideHeld = false,
+		StandUpPending = false,
 		Grounded = true,
 		LastGroundedTime = 0,
 		JumpedSinceGrounded = false,

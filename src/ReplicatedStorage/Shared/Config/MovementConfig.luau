@@ -219,8 +219,20 @@ local MovementConfig = {
 		CooldownTolerance = 0.5,
 		StaminaTolerance = 15,
 		GrappleRangeTolerance = 25,
-		-- Ignore samples for this long after a correction or scripted teleport.
+		-- After a correction, spawn or scripted teleport the owner may still stream positions from
+		-- before it. For this long only positions reachable from the new anchor are accepted.
 		SettleTime = 0.6,
+		SettleMargin = 12,
+		-- A sample without movement (idle or a replication stall) keeps the previous baseline, so
+		-- the next movement is measured over the whole gap, up to this many seconds. Prevents a
+		-- Wi-Fi hiccup from looking like a speed hack.
+		MaxStallCompensation = 1.5,
+		-- Server-measured horizontal speed needed to start a slide (lenient vs. the client rule).
+		SlideEntrySpeed = 10,
+		-- Descent per sample (studs) that counts as sliding downhill, unlocking Slide.MaxSpeed.
+		DownhillDescent = 0.5,
+		-- Sustained actions without an "End" are closed this long after their longest honest duration.
+		SustainedGrace = 0.5,
 		ActionRate = 15,
 		ActionBurst = 25,
 		-- Other players further away than this do not receive cosmetic movement FX.

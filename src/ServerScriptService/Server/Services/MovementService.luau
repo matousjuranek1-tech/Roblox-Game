@@ -5,14 +5,19 @@
 	(Roblox network ownership), so the server cannot run the movement itself. Instead it:
 
 	  1. Validates every ability the client reports (MovementAction remote): known action,
-	     rate limit, cooldown, unlock, stamina (server-side mirror), and action-specific payload
-	     (grapple target must be a real tagged point in range, wall-run side must be +-1).
+	     rate limit, cooldown, unlock, stamina (server-side mirror), and action-specific checks
+	     (grapple target must be a real tagged point in range, a slide must start grounded and
+	     moving, a wall-run side must be +-1).
 	  2. Opens a speed "allowance" for each accepted ability (dash, grapple, launch momentum...).
-	  3. Samples every character at 5 Hz and compares its real speed against the envelope.
-	     Repeated or severe violations rubber-band the character to its last valid grounded spot.
+	     Sustained abilities close on "End" or, if it never arrives, after their longest honest
+	     duration, and closing shortens the allowance to the launch window.
+	  3. Samples every character at 5 Hz against the envelope. Repeated or severe violations
+	     rubber-band the character to its last valid grounded spot.
 	  4. Publishes accepted actions to other clients: the MoveState/MoveSide character attributes
 	     (for poses) and the MovementFx unreliable remote (for rope, trail and dust effects).
 
+	Every server-side teleport (spawn, correction, checkpoint) re-anchors validation at the new
+	position; while settling, only positions reachable from that anchor are accepted.
 	Rejections are reported back through MovementCorrection so the client cancels its prediction.
 ]]
 
@@ -36,6 +41,10 @@ local Attributes = WorldConfig.Attributes
 
 local GROUND_PROBE_LENGTH = 6
 local WARN_INTERVAL = 5
+-- Displacement below this between samples counts as "no movement replicated".
+local STALL_EPSILON = 0.05
+-- A slide may also start right out of a dash, before the sampler has seen the speed.
+local DASH_TO_SLIDE_WINDOW = 0.8
 
 type Rule = {
 	StaminaCost: number,
@@ -48,23 +57,33 @@ type Rule = {
 	Window: number,
 	-- Clears the MoveState attribute after this many seconds (non-sustained actions).
 	AutoClear: number?,
+	-- Longest honest duration of a sustained action (it is closed after this plus a grace).
+	MaxDuration: number?,
 	-- Name of the "Unlock_<Name>" player attribute required to use the action.
 	Unlock: string?,
 }
 
 type PlayerState = {
+	-- Character whose spawn was anchored; others (mid-respawn) are not sampled or trusted.
+	Character: Model?,
 	StaminaAtSpend: number,
 	LastSpend: number,
 	LastStart: { [string]: number },
 	ActiveSustained: { [string]: number },
+	SustainedDeadline: { [string]: number },
 	AllowedHorizontal: number,
 	AllowedUp: number,
 	AllowanceExpires: number,
 	StateToken: number,
+	-- Baseline of the speed measurement: last accepted position that actually moved.
 	LastSamplePosition: Vector3?,
 	LastSampleTime: number,
+	NextSampleTime: number,
+	LastHorizontalSpeed: number,
 	LastValidCFrame: CFrame?,
 	Violations: { number },
+	SettleAnchor: Vector3?,
+	SettleStart: number,
 	SettleUntil: number,
 	LastWarn: number,
 }
@@ -98,18 +117,22 @@ local function buildRules(): { [string]: Rule }
 		Slide = {
 			StaminaCost = 0,
 			MinInterval = c.Slide.Cooldown,
-			Horizontal = c.Slide.MaxSpeed,
+			-- Flat slides never exceed StartSpeed (faster entries come from a dash, which has its own
+			-- allowance). Slide.MaxSpeed is granted only while the sampler sees the player descend.
+			Horizontal = c.Slide.StartSpeed,
 			-- Slide-hop jumps out of the slide.
 			Up = JUMP_VELOCITY,
 			Window = c.Slide.MaxDownhillDuration + launch,
+			MaxDuration = c.Slide.MaxDownhillDuration,
 		},
 		WallRun = {
-			-- Drained on "End" from the real wall-run duration.
+			-- Drained when the wall run closes, from its real duration.
 			StaminaCost = 0,
 			MinInterval = c.WallRun.Cooldown,
 			Horizontal = wallRunTop,
 			Up = c.WallRun.InitialUpVelocity + JUMP_VELOCITY * 0.3,
 			Window = c.WallRun.MaxDuration + launch,
+			MaxDuration = c.WallRun.MaxDuration,
 		},
 		WallJump = {
 			StaminaCost = c.WallJump.StaminaCost,
@@ -131,8 +154,9 @@ local function buildRules(): { [string]: Rule }
 			MinInterval = c.Grapple.Cooldown,
 			Horizontal = c.Grapple.PullSpeed,
 			Up = c.Grapple.PullSpeed,
-			-- Replaced per request by the real distance-based duration.
+			-- Window and MaxDuration are replaced per request by the real distance-based duration.
 			Window = c.Grapple.Range / c.Grapple.PullSpeed + c.Grapple.FireTime + c.Grapple.TimeoutPadding + launch,
+			MaxDuration = c.Grapple.Range / c.Grapple.PullSpeed + c.Grapple.FireTime + c.Grapple.TimeoutPadding,
 		},
 	}
 end
@@ -149,18 +173,24 @@ local fxRemote: UnreliableRemoteEvent
 
 local function newState(): PlayerState
 	return {
+		Character = nil,
 		StaminaAtSpend = MovementConfig.Stamina.Max,
 		LastSpend = 0,
 		LastStart = {},
 		ActiveSustained = {},
+		SustainedDeadline = {},
 		AllowedHorizontal = BASE_HORIZONTAL,
 		AllowedUp = BASE_UP,
 		AllowanceExpires = 0,
 		StateToken = 0,
 		LastSamplePosition = nil,
 		LastSampleTime = 0,
+		NextSampleTime = 0,
+		LastHorizontalSpeed = 0,
 		LastValidCFrame = nil,
 		Violations = {},
+		SettleAnchor = nil,
+		SettleStart = 0,
 		SettleUntil = 0,
 		LastWarn = 0,
 	}
@@ -181,6 +211,10 @@ local function spendStamina(state: PlayerState, now: number, amount: number)
 	state.LastSpend = now
 end
 
+local function allowanceGrace(ping: number): number
+	return Validation.AllowanceGrace + ping * 2
+end
+
 local function grantAllowance(
 	state: PlayerState,
 	horizontal: number,
@@ -189,7 +223,7 @@ local function grantAllowance(
 	now: number,
 	ping: number
 )
-	local expires = now + window + Validation.AllowanceGrace + ping * 2
+	local expires = now + window + allowanceGrace(ping)
 	if now > state.AllowanceExpires then
 		state.AllowedHorizontal = horizontal
 		state.AllowedUp = up
@@ -217,49 +251,82 @@ local function isGrounded(root: BasePart): boolean
 	return workspace:Raycast(root.Position, Vector3.new(0, -GROUND_PROBE_LENGTH, 0), groundParams) ~= nil
 end
 
-local function resetSampling(state: PlayerState, now: number)
-	state.LastSamplePosition = nil
+-- Re-anchors validation at a position the server itself placed the character at.
+local function anchorAt(state: PlayerState, cframe: CFrame, now: number)
+	state.LastValidCFrame = cframe
+	state.LastSamplePosition = cframe.Position
+	state.LastSampleTime = now
+	state.LastHorizontalSpeed = 0
+	state.SettleAnchor = cframe.Position
+	state.SettleStart = now
 	state.SettleUntil = now + Validation.SettleTime
 	table.clear(state.Violations)
 end
 
 local function correct(player: Player, state: PlayerState, root: BasePart, reason: string)
-	local character = player.Character
+	local now = os.clock()
 	local target = state.LastValidCFrame
-	if character and target then
-		root.AssemblyLinearVelocity = Vector3.zero
-		character:PivotTo(target)
-	end
-	resetSampling(state, os.clock())
 	correctionRemote:FireClient(player, "Corrected")
 	warnThrottled(player, state, `corrected ({reason})`)
+	local character = player.Character
+	if not character or not target then
+		-- No trusted position to return to: respawn rather than trust the current one.
+		task.spawn(function()
+			player:LoadCharacterAsync()
+		end)
+		return
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	character:PivotTo(target)
+	anchorAt(state, target, now)
+end
+
+-- Ends a sustained action: charges wall-run stamina, clears its pose and shortens the
+-- allowance to the momentum it can legitimately leave behind.
+local function closeSustained(player: Player, state: PlayerState, action: string, now: number)
+	local started = state.ActiveSustained[action]
+	if not started then
+		return
+	end
+	state.ActiveSustained[action] = nil
+	state.SustainedDeadline[action] = nil
+	if action == "WallRun" then
+		local duration = math.min(now - started, MovementConfig.WallRun.MaxDuration)
+		spendStamina(state, now, duration * MovementConfig.WallRun.StaminaPerSecond)
+	end
+	local launchEnd = now + Validation.LaunchWindow + allowanceGrace(player:GetNetworkPing())
+	state.AllowanceExpires = math.min(state.AllowanceExpires, launchEnd)
+	local character = player.Character
+	if character and character:GetAttribute(Attributes.MoveState) == action then
+		state.StateToken += 1
+		character:SetAttribute(Attributes.MoveState, nil)
+	end
 end
 
 local function checkPlayer(player: Player, state: PlayerState, now: number)
+	state.NextSampleTime = now + Validation.SampleInterval
+
+	for action, deadline in state.SustainedDeadline do
+		if now > deadline then
+			closeSustained(player, state, action, now)
+		end
+	end
+
+	if player.Character ~= state.Character then
+		return
+	end
 	local root = CharacterService:GetRoot(player)
 	local humanoid = CharacterService:GetHumanoid(player)
 	if not root or not humanoid or humanoid.SeatPart ~= nil then
-		state.LastSamplePosition = nil
+		return
+	end
+	local position = root.Position
+	local previous = state.LastSamplePosition
+	if previous == nil then
+		state.LastSamplePosition = position
 		state.LastSampleTime = now
 		return
 	end
-
-	local previous = state.LastSamplePosition
-	local elapsed = now - state.LastSampleTime
-	local position = root.Position
-	state.LastSamplePosition = position
-	state.LastSampleTime = now
-
-	if previous == nil or now < state.SettleUntil then
-		if isGrounded(root) then
-			state.LastValidCFrame = root.CFrame
-		end
-		return
-	end
-
-	local delta = position - previous
-	local horizontalSpeed = Vector3.new(delta.X, 0, delta.Z).Magnitude / elapsed
-	local upSpeed = math.max(delta.Y, 0) / elapsed
 
 	local allowedHorizontal = BASE_HORIZONTAL
 	local allowedUp = BASE_UP
@@ -267,9 +334,47 @@ local function checkPlayer(player: Player, state: PlayerState, now: number)
 		allowedHorizontal = math.max(allowedHorizontal, state.AllowedHorizontal)
 		allowedUp = math.max(allowedUp, state.AllowedUp)
 	end
+
+	if now < state.SettleUntil then
+		-- Stale positions from before the teleport are ignored; only reachable ones move the
+		-- baseline, and nothing seen while settling can become the rubber-band target.
+		local anchor = state.SettleAnchor
+		local reach = allowedHorizontal * Validation.SpeedTolerance * (now - state.SettleStart)
+			+ Validation.SettleMargin
+		if anchor and (position - anchor).Magnitude <= reach then
+			state.LastSamplePosition = position
+			state.LastSampleTime = now
+		end
+		return
+	end
+
+	local delta = position - previous
+	if delta.Magnitude < STALL_EPSILON then
+		-- Idle or a replication stall: keep the baseline so the next movement is measured over the
+		-- whole gap instead of looking like one huge jump in a single sample.
+		state.LastHorizontalSpeed = 0
+		if isGrounded(root) then
+			state.LastValidCFrame = root.CFrame
+		end
+		return
+	end
+
+	local elapsed = math.clamp(now - state.LastSampleTime, Validation.SampleInterval, Validation.MaxStallCompensation)
+	local horizontalSpeed = Vector3.new(delta.X, 0, delta.Z).Magnitude / elapsed
+	local upSpeed = math.max(delta.Y, 0) / elapsed
+	state.LastSamplePosition = position
+	state.LastSampleTime = now
+	state.LastHorizontalSpeed = horizontalSpeed
+
+	if state.ActiveSustained.Slide and delta.Y < -Validation.DownhillDescent then
+		-- Sliding downhill legitimately reaches Slide.MaxSpeed and may carry it into a slide-hop.
+		local slideTop = MovementConfig.Slide.MaxSpeed
+		state.AllowedHorizontal = math.max(state.AllowedHorizontal, slideTop)
+		allowedHorizontal = math.max(allowedHorizontal, slideTop)
+	end
+
 	local limitHorizontal = allowedHorizontal * Validation.SpeedTolerance + Validation.FlatTolerance
 	local limitUp = allowedUp * Validation.SpeedTolerance + Validation.FlatTolerance
-
 	if horizontalSpeed <= limitHorizontal and upSpeed <= limitUp then
 		if isGrounded(root) then
 			state.LastValidCFrame = root.CFrame
@@ -347,22 +452,6 @@ local function validateGrapple(root: BasePart, payload: unknown): (BasePart?, nu
 	return part, distance
 end
 
-local function handleEnd(state: PlayerState, character: Model, action: string, now: number)
-	local started = state.ActiveSustained[action]
-	if not started then
-		return
-	end
-	state.ActiveSustained[action] = nil
-	if action == "WallRun" then
-		local duration = math.min(now - started, MovementConfig.WallRun.MaxDuration)
-		spendStamina(state, now, duration * MovementConfig.WallRun.StaminaPerSecond)
-	end
-	if character:GetAttribute(Attributes.MoveState) == action then
-		state.StateToken += 1
-		character:SetAttribute(Attributes.MoveState, nil)
-	end
-end
-
 local function handleStart(
 	player: Player,
 	state: PlayerState,
@@ -391,6 +480,7 @@ local function handleStart(
 	-- Relay payloads are rebuilt from validated values; raw client tables are never forwarded.
 	local relayPayload: { [string]: any }? = nil
 	local window = rule.Window
+	local maxDuration = rule.MaxDuration
 	local side = 0
 	if action == "Grapple" then
 		local target, distance = validateGrapple(root, payload)
@@ -400,7 +490,18 @@ local function handleStart(
 		end
 		relayPayload = { Target = target }
 		local grapple = MovementConfig.Grapple
-		window = distance / grapple.PullSpeed + grapple.FireTime + grapple.TimeoutPadding + Validation.LaunchWindow
+		local pullDuration = distance / grapple.PullSpeed + grapple.FireTime + grapple.TimeoutPadding
+		maxDuration = pullDuration
+		window = pullDuration + Validation.LaunchWindow
+	elseif action == "Slide" then
+		local lastDash = state.LastStart.Dash
+		local fromDash = lastDash ~= nil and now - lastDash <= DASH_TO_SLIDE_WINDOW
+		-- The last sample can be up to 0.2 s old; the replicated velocity covers a fresh sprint.
+		local speed = math.max(state.LastHorizontalSpeed, MathUtil.flat(root.AssemblyLinearVelocity).Magnitude)
+		if not isGrounded(root) or (speed < Validation.SlideEntrySpeed and not fromDash) then
+			reject(player, state, action, "not grounded or too slow")
+			return
+		end
 	elseif action == "WallRun" then
 		local data = Validate.smallTable(payload, 2)
 		local requestedSide = if data then data.Side else nil
@@ -412,13 +513,18 @@ local function handleStart(
 		relayPayload = { Side = side }
 	end
 
+	if MovementProtocol.Sustained[action] then
+		-- A new start implicitly closes (and charges) a previous one that never sent "End".
+		closeSustained(player, state, action, now)
+	end
 	state.LastStart[action] = now
 	if rule.StaminaCost > 0 then
 		spendStamina(state, now, rule.StaminaCost)
 	end
 	grantAllowance(state, rule.Horizontal, rule.Up, window, now, player:GetNetworkPing())
-	if MovementProtocol.Sustained[action] then
+	if MovementProtocol.Sustained[action] and maxDuration then
 		state.ActiveSustained[action] = now
+		state.SustainedDeadline[action] = now + maxDuration + Validation.SustainedGrace
 	end
 	setMoveState(character, state, action, side, rule.AutoClear or window)
 	relayFx(player, root, action, relayPayload)
@@ -437,13 +543,13 @@ local function onMovementAction(player: Player, kind: unknown, action: unknown, 
 	end
 	local character = player.Character
 	local root = CharacterService:GetRoot(player)
-	if not character or not root then
+	if not character or not root or character ~= state.Character then
 		return
 	end
 
 	local now = os.clock()
 	if kind == "End" then
-		handleEnd(state, character, action, now)
+		closeSustained(player, state, action, now)
 	else
 		handleStart(player, state, character, root, action, payload, now)
 	end
@@ -475,16 +581,16 @@ function MovementService:Start()
 		limiter:Remove(player)
 	end)
 
-	CharacterService.CharacterReady:Connect(function(player, _character, _humanoid, root)
+	CharacterService.CharacterReady:Connect(function(player, character, _humanoid, root)
 		local state = states[player]
 		if not state then
 			return
 		end
-		local now = os.clock()
-		resetSampling(state, now)
+		state.Character = character
 		table.clear(state.ActiveSustained)
+		table.clear(state.SustainedDeadline)
 		state.AllowanceExpires = 0
-		state.LastValidCFrame = root.CFrame
+		anchorAt(state, root.CFrame, os.clock())
 	end)
 
 	Remotes.Event("MovementAction").OnServerEvent:Connect(onMovementAction)
@@ -492,19 +598,19 @@ function MovementService:Start()
 	RunService.Heartbeat:Connect(function()
 		local now = os.clock()
 		for player, state in states do
-			if now - state.LastSampleTime >= Validation.SampleInterval then
+			if now >= state.NextSampleTime then
 				checkPlayer(player, state, now)
 			end
 		end
 	end)
 end
 
--- Call before any scripted teleport (checkpoints, respawn points) so it is not flagged.
-function MovementService:NotifyTeleport(player: Player)
+-- Call right before any scripted teleport (checkpoints, restarts) with its destination, so
+-- validation re-anchors there instead of flagging the jump or trusting stale positions.
+function MovementService:NotifyTeleport(player: Player, destination: CFrame)
 	local state = states[player]
 	if state then
-		resetSampling(state, os.clock())
-		state.LastValidCFrame = nil
+		anchorAt(state, destination, os.clock())
 	end
 end
 

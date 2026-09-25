@@ -63,10 +63,13 @@ Slide.Ability = {
 		if not ctx.Grounded or not ctx:IsReady("Slide", os.clock()) then
 			return false
 		end
-		return ctx.Sprinting or ctx:FlatVelocity().Magnitude >= Config.MinEntrySpeed
+		-- Needs real speed: a sprint that is already moving, or MinEntrySpeed (e.g. out of a dash).
+		local speed = ctx:FlatVelocity().Magnitude
+		return speed >= Config.MinEntrySpeed or (ctx.Sprinting and speed >= MovementConfig.Walk.Speed * 0.75)
 	end,
 
 	Start = function(ctx: Context, _request: any): MovementContext.Payload?
+		ctx.StandUpPending = false
 		local flatVelocity = ctx:FlatVelocity()
 		local fallback = if ctx:MoveDirection().Magnitude > 0.1 then ctx:MoveDirection().Unit else ctx:LookDirection()
 		state.Direction = MathUtil.safeUnit(flatVelocity, fallback)
@@ -113,7 +116,13 @@ Slide.Ability = {
 	end,
 
 	Stop = function(ctx: Context, reason: string): (string?, any)
-		ctx.Humanoid.HipHeight = ctx.DefaultHipHeight
+		if Slide.HasHeadroom(ctx) then
+			ctx.Humanoid.HipHeight = ctx.DefaultHipHeight
+		else
+			-- Forced out of the slide under an obstacle: MovementController stands the
+			-- character up once there is room, instead of wedging it into the ceiling now.
+			ctx.StandUpPending = true
+		end
 		ctx:ReleaseFacing()
 		ctx:ReleaseMover()
 		ctx:SetCooldown("Slide", Config.Cooldown, os.clock())

@@ -9,6 +9,8 @@
 	  * Touch gets custom buttons arranged around Roblox's jump button, shown only while the
 	    player's preferred input is touch.
 	  * Sprint is held on keyboard and toggled on gamepad/touch.
+	  * JumpPressed fires once per physical press. Roblox's JumpRequest repeats while jump is
+	    held, which would turn one held press into wall jumps or grapple releases.
 ]]
 
 local ContextActionService = game:GetService("ContextActionService")
@@ -32,11 +34,19 @@ local TOUCH_LAYOUT: { [string]: Vector2 } = {
 	Sprint = Vector2.new(-2.35, 0.05),
 }
 local TOUCH_BUTTON_SCALE = 0.72
+-- Keyboard/gamepad keys that jump with Roblox's default controls.
+local JUMP_KEYS: { [Enum.KeyCode]: boolean } = {
+	[Enum.KeyCode.Space] = true,
+	[Enum.KeyCode.ButtonA] = true,
+}
+-- Touch jump presses are detected from JumpRequest; a gap this long means a new press.
+local TOUCH_REPRESS_GAP = 0.12
 
 local InputController = {
 	ActionBegan = Signal.new() :: Signal.Signal<string>,
 	ActionEnded = Signal.new() :: Signal.Signal<string>,
-	JumpRequested = Signal.new() :: Signal.Signal<>,
+	-- A new jump press (not the repeats Roblox sends while jump is held).
+	JumpPressed = Signal.new() :: Signal.Signal<>,
 	InputKindChanged = Signal.new() :: Signal.Signal<InputKind>,
 	SprintToggleChanged = Signal.new() :: Signal.Signal<boolean>,
 }
@@ -245,8 +255,21 @@ function InputController:Start()
 		end
 	end
 
+	-- The default ControlModule binds jump through ContextActionService, so these inputs arrive
+	-- marked as game-processed; only a focused TextBox (chat) should suppress them.
+	UserInputService.InputBegan:Connect(function(input)
+		if JUMP_KEYS[input.KeyCode] and not UserInputService:GetFocusedTextBox() then
+			InputController.JumpPressed:Fire()
+		end
+	end)
+	local lastJumpRequest = 0
 	UserInputService.JumpRequest:Connect(function()
-		InputController.JumpRequested:Fire()
+		local now = os.clock()
+		local isNewPress = now - lastJumpRequest > TOUCH_REPRESS_GAP
+		lastJumpRequest = now
+		if isNewPress and inputKind == "Touch" then
+			InputController.JumpPressed:Fire()
+		end
 	end)
 
 	UserInputService:GetPropertyChangedSignal("PreferredInput"):Connect(function()

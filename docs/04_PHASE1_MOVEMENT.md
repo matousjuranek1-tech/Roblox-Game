@@ -137,6 +137,12 @@ Rojo mapování: `*.server.luau` = **Script**, `*.client.luau` = **LocalScript**
 
 **Předávání stavu:** každá schopnost vrací ze `Stop()` volitelné navazující akce. Například wall run → wall jump → **Launch** (hybnost) → grapple → Launch. Díky tomu je řetězení vždy rychlejší než běh.
 
+**Validace na serveru (shrnutí):**
+- Každý serverový teleport (spawn, korekce, checkpoint) validaci **ukotví** na cílové pozici. V „settle“ okně (0,6 s) se přijímají jen pozice dosažitelné z kotvy a nic z tohoto okna se nestane cílem rubber-bandu.
+- Vzorek bez pohybu (stání nebo výpadek replikace) neposouvá základnu. Další pohyb se změří přes celou mezeru (max. 1,5 s), takže Wi-Fi zakolísání nevypadá jako speed hack.
+- Trvalé akce (slide, wall run, grapple) se uzavřou na „End“, na další Start, nebo po své nejdelší poctivé délce. Uzavření zkrátí povolení na launch okno a naúčtuje staminu wall runu.
+- Na klientu reagují wall jump, uvolnění grapplu a slide-hop jen na **čerstvý stisk** skoku (podržený skok je neopakuje).
+
 **Připravenost na další fáze:**
 - `MovementController.ActionStarted("Dash")` je hook pro **perfect dodge** (PHASE 2). Server má `MovementService:GetLastActionTime(player, "Dash")` pro i-frames.
 - Grapple čte pozici cíle každý frame, takže funguje na **pohyblivých kotvách Titána** (PHASE 4). Rotující rameno v Labu to ověřuje.
@@ -197,6 +203,7 @@ Server validace čte stejný config, takže po zrychlení schopnosti se automati
 | Pózy jsou procedurální (bez autorských animací) | PHASE 9 (AnimationController zůstane jako vrstva) |
 | Pohyb zatím nemá zvuky | PHASE 9 (AudioController) |
 | Air Dash je odemčený pro všechny (`DefaultUnlocks`) | PHASE 6 (Movement skill tree) |
-| Server stamina pro wall run se odečítá až na konci běhu | stačí pro anti-exploit. Plná simulace není potřeba. |
+| Server stamina pro wall run se odečítá až při uzavření běhu („End“ nebo vypršení) | stačí pro anti-exploit. Plná simulace není potřeba. |
+| Upravený klient, který opakovaně posílá Start slidu, udrží na zemi až ~68 studs/s (StartSpeed × 1,25 + 8). Slide vyžaduje zem a pohyb a MaxSpeed povolí jen při sjezdu. | PHASE 7: integrátor „distance budget“ (povolená vzdálenost za okno místo okamžité rychlosti) |
 | Detekce „vznášení“ (fly hack bez horizontální rychlosti) | PHASE 7 (anti-cheat hardening) |
 | Pózy předpokládají R15 | R15 je povinné nastavení Experience |
